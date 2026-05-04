@@ -43,6 +43,8 @@
 2.  Install Python dependencies:
     ```bash
     pip install -r requirements.txt
+    # To install in editable mode:
+    pip install -e .
     ```
 
 ## 🎮 Usage
