@@ -38,12 +38,13 @@ class LocalWhisperCLI:
         self.last_refined_text: Optional[str] = None
         self.menu_active: bool = True
         self.next_recording_is_instruction: bool = False
+        self.hotkey_locked: bool = False  # True when the menu owns the recording
 
     def print_menu(self) -> None:
         """Display the interactive menu."""
         print("\n--------------------------------")
         print(f"[r] 🎤 Record New (HotKey: {HOTKEY_COMBINATION})")
-        print(f"[v] 🗣️  Modify with Voice (HotKey: {HOTKEY_COMBINATION})")
+        print("[v] 🗣️  Modify with Voice (ENTER to stop)")
         print("[m] ✏️  Modify with Text")
         print("[s] 📋 Show last text")
         print("[q] 🚪 Quit")
@@ -51,6 +52,8 @@ class LocalWhisperCLI:
 
     def on_activate(self) -> None:
         """Handle hotkey activation to toggle recording."""
+        if self.hotkey_locked:
+            return  # Menu owns this recording; hotkey has no effect
         with self.processing_lock:
             if self.is_recording:
                 self.stop_and_process()
@@ -59,7 +62,7 @@ class LocalWhisperCLI:
 
     def start_capture(self) -> None:
         """Start audio capture."""
-        print("\n\n🎤 Starting recording... (Press hotkey again to stop)")
+        print("\n\n🎤 Starting recording... (Press ENTER or hotkey again to stop)")
         self.is_recording = True
         self.recorder.start_recording()
 
@@ -197,13 +200,24 @@ class LocalWhisperCLI:
                 break
             
             if not choice:
+                if self.is_recording and not self.hotkey_locked:
+                    self.stop_and_process()
                 continue
 
             if choice == 'r':
                 self.on_activate()
             elif choice == 'v':
-                print(f"\n🎤 Ready to record instruction. Press {HOTKEY_COMBINATION} to start/stop.")
+                if not self.last_raw_text:
+                    print("\n❌ No text to modify yet! Record something first.")
+                    self.print_menu()
+                    continue
                 self.next_recording_is_instruction = True
+                self.hotkey_locked = True
+                self.start_capture()
+                print("\nPress ENTER to stop recording...")
+                input()
+                self.hotkey_locked = False
+                self.stop_and_process()
             elif choice == 'm':
                 self.modify_last_text()
             elif choice == 's':
@@ -224,6 +238,15 @@ class LocalWhisperCLI:
 
 def main() -> None:
     """Main entry point for LocalWhisper."""
+    # ctranslate2 (used by faster-whisper) registers semaphores with
+    # multiprocessing.resource_tracker that are never cleanly released when
+    # os._exit() is called.  Suppress the resulting UserWarning by setting
+    # PYTHONWARNINGS before the resource tracker subprocess is forked.
+    os.environ.setdefault(
+        "PYTHONWARNINGS",
+        "ignore::UserWarning:multiprocessing.resource_tracker",
+    )
+
     print("🚀 Live Capture Ready!")
     try:
         app = LocalWhisperCLI()
@@ -232,6 +255,7 @@ def main() -> None:
         listener = keyboard.GlobalHotKeys({
             HOTKEY_COMBINATION: app.on_activate
         })
+        listener.daemon = True
         listener.start()
         
         # Start Interactive CLI

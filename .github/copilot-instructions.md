@@ -62,7 +62,7 @@ Standard settings for voice recording:
 3. **Clean up resources**: Delete temporary audio files after processing
 4. **Provide user feedback**: Use emoji prefixes for status messages (🎤, ✅, ❌, etc.)
 5. **Keep it offline**: All processing must work without internet connectivity
-6. **macOS focus**: This project targets macOS; consider platform-specific behaviors
+6. **macOS focus**: This project targets macOS; consider platform-specific behaviors. The global hotkey (`pynput.GlobalHotKeys`) requires the **Terminal** you are using (or your Python binary) to be listed under **System Settings → Privacy & Security → Accessibility**. Remind users to add `venv/bin/python` when documenting setup steps.
 
 ## Common Tasks
 

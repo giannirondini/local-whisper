@@ -7,7 +7,7 @@ name = "LocalWhisper"
 version = "0.1.0"
 description = "A privacy-focused, local voice-to-text tool for macOS."
 authors = [
-    {name = "Gianni Rondini", email = ""},
+    {name = "Gianni Rondini"},
 ]
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,6 +39,9 @@ dev = [
     "types-requests",
     "types-pyaudio",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 100

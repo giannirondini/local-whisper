@@ -30,6 +30,7 @@
     ```bash
     brew install portaudio
     ```
+4.  **Accessibility Permission**: The global hotkey requires the **Terminal you are using** itself to be trusted. Go to **System Settings → Privacy & Security → Accessibility** and add your terminal application (*e.g., Terminal, iTerm2, Ghostty*).
 
 ## 🚀 Installation
 

@@ -21,6 +21,7 @@ LocalWhisper is built on these core principles:
 3. Install dependencies:
    ```bash
    pip install -r requirements.txt
+   pip install -e .
    ```
 4. Make sure you have Ollama running with a model:
    ```bash
@@ -52,9 +53,10 @@ Before submitting a PR:
 ## 🔧 Development Setup
 
 ### Prerequisites
-- Python 3.10+
+- Python 3.10+ (use pyenv if needed: `pyenv install 3.11.9 && pyenv local 3.11.9`)
 - PortAudio: `brew install portaudio`
 - Ollama: [ollama.com](https://ollama.com)
+- **Accessibility Permission**: add **your Terminal** to **System Settings → Privacy & Security → Accessibility** for the global hotkey to work
 
 ### Running the App
 ```bash
