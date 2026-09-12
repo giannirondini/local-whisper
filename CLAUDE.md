@@ -1,0 +1,1 @@
+Use the content from [.github/copilot-instructions.md](.github/copilot-instructions.md).

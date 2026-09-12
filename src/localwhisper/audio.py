@@ -1,95 +1,151 @@
 """Audio recording module for LocalWhisper.
 
-This module handles microphone input capture using PyAudio,
-recording audio in a format suitable for Whisper transcription.
+This module captures microphone input with PyAudio in callback mode and returns
+the recording as an in-memory float32 buffer ready for Whisper. No audio is
+written to disk unless `save_wav()` is called explicitly.
 """
 
 from __future__ import annotations
 
-import pyaudio
-import wave
-import tempfile
+import logging
 import threading
-from typing import Optional
+import wave
+from collections.abc import Mapping
+
+import numpy as np
+import pyaudio
 
 # Configuration Constants
 SAMPLE_RATE: int = 16000
 CHANNELS: int = 1
 CHUNK: int = 1024
+SAMPLE_FORMAT: int = pyaudio.paInt16
+_INT16_SCALE: float = 32768.0
+
+logger = logging.getLogger(__name__)
+
+
+class AudioDeviceError(Exception):
+    """Raised when the input stream cannot be opened (no device, permission denied...)."""
 
 
 class AudioRecorder:
-    """Records audio from the microphone and saves to temporary WAV files."""
+    """Records audio from the microphone into memory.
+
+    PortAudio invokes `_callback` on its own thread for every CHUNK of samples;
+    the recorder only appends the raw PCM bytes. This removes the Python read loop
+    and the overflow/race problems that came with it.
+    """
 
     def __init__(self) -> None:
         """Initialize the audio recorder."""
         self.recording: bool = False
         self.frames: list[bytes] = []
+        self.dropped_chunks: int = 0
         self.p: pyaudio.PyAudio = pyaudio.PyAudio()
-        self.stream: Optional[pyaudio.Stream] = None
+        self.stream: pyaudio.Stream | None = None
+        self._frames_lock = threading.Lock()
+        self._terminated = False
 
     def start_recording(self) -> None:
-        """Start a new recording session."""
-        self.recording = True
-        self.frames = []
-        
+        """Start a new recording session.
+
+        Raises:
+            AudioDeviceError: If the input stream cannot be opened. The recorder is
+                left idle so a later attempt can succeed.
+        """
+        if self._terminated:
+            raise AudioDeviceError("Recorder has been terminated")
+        with self._frames_lock:
+            self.frames = []
+            self.dropped_chunks = 0
+
         try:
-            self.stream = self.p.open(format=pyaudio.paInt16,
-                                      channels=CHANNELS,
-                                      rate=SAMPLE_RATE,
-                                      input=True,
-                                      frames_per_buffer=CHUNK)
-            print("🎤 Recording started...")
-            threading.Thread(target=self._record_loop).start()
-        except Exception as e:
-            print(f"❌ Error starting audio stream: {e}")
+            self.stream = self.p.open(
+                format=SAMPLE_FORMAT,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+                stream_callback=self._callback,
+            )
+            self.recording = True
+            logger.info("Recording started")
+        except OSError as e:
+            self.stream = None
             self.recording = False
+            raise AudioDeviceError(str(e)) from e
 
-    def _record_loop(self) -> None:
-        """Internal loop to read audio frames."""
-        while self.recording:
-            try:
-                data = self.stream.read(CHUNK)
-                self.frames.append(data)
-            except Exception as e:
-                print(f"Error recording: {e}")
-                break
+    def _callback(
+        self,
+        in_data: bytes | None,
+        frame_count: int,
+        time_info: Mapping[str, float],
+        status: int,
+    ) -> tuple[bytes | None, int]:
+        """PortAudio callback: store the incoming PCM chunk.
 
-    def stop_recording(self) -> Optional[str]:
-        """Stop recording and save to a temporary WAV file.
+        Runs on PortAudio's thread. Must stay cheap and must not raise.
+        """
+        if status & pyaudio.paInputOverflow:
+            self.dropped_chunks += 1
+        if in_data:
+            with self._frames_lock:
+                self.frames.append(in_data)
+        return (None, pyaudio.paContinue)
+
+    def stop_recording(self) -> np.ndarray | None:
+        """Stop recording and return the captured audio.
 
         Returns:
-            Path to the temporary WAV file, or None if no audio was recorded.
+            Mono float32 samples in [-1, 1] at SAMPLE_RATE, or None if nothing was
+            captured.
         """
         self.recording = False
         if self.stream is not None:
-            self.stream.stop_stream()
-            self.stream.close()
+            try:
+                self.stream.stop_stream()  # blocks until the last callback returns
+                self.stream.close()
+            except OSError as e:
+                logger.warning("Error closing audio stream: %s", e)
             self.stream = None
-            
-        print("🛑 Recording stopped.")
-        return self._save_temp_wav()
 
-    def _save_temp_wav(self) -> Optional[str]:
-        """Save recorded frames to a temporary file.
+        logger.info("Recording stopped (%d chunk(s) dropped)", self.dropped_chunks)
 
-        Returns:
-            Path to the temporary WAV file, or None if no frames were recorded.
-        """
-        if not self.frames:
+        with self._frames_lock:
+            pcm = b"".join(self.frames)
+            self.frames = []
+
+        if not pcm:
             return None
-        
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                temp_filename = f.name
-            
-            wf = wave.open(temp_filename, 'wb')
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(self.p.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b''.join(self.frames))
-            wf.close()
-            return temp_filename
-        except Exception as e:
-            print(f"❌ Error saving audio file: {e}")
-            return None
+        return pcm_to_float32(pcm)
+
+    def duration_seconds(self) -> float:
+        """Seconds of audio buffered so far."""
+        with self._frames_lock:
+            samples = sum(len(chunk) for chunk in self.frames) // 2  # 2 bytes per int16
+        return samples / SAMPLE_RATE
+
+    def terminate(self) -> None:
+        """Release PortAudio. Idempotent; the recorder is unusable afterwards."""
+        if self._terminated:
+            return
+        self._terminated = True
+        if self.stream is not None:
+            self.stop_recording()
+        self.p.terminate()
+
+
+def pcm_to_float32(pcm: bytes) -> np.ndarray:
+    """Convert little-endian int16 PCM bytes to a float32 array in [-1, 1]."""
+    return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / _INT16_SCALE
+
+
+def save_wav(audio: np.ndarray, path: str) -> None:
+    """Write a float32 buffer to a 16-bit mono WAV file. Debugging aid only."""
+    pcm = np.clip(audio * _INT16_SCALE, -_INT16_SCALE, _INT16_SCALE - 1).astype(np.int16)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm.tobytes())
