@@ -2,9 +2,11 @@
 
 Both `UNUserNotificationCenter` and the legacy `NSUserNotification` (what `rumps`
 wraps) require the process to run inside an app bundle with a `CFBundleIdentifier`;
-from a virtualenv's `python` there is none and both fail. Until the `.app` bundle
-exists (UI plan session U4) the notification goes through `osascript`, which
-works from any process (the banner is attributed to Script Editor). The text is
+from a virtualenv's `python` there is none and both fail. The notification goes
+through `osascript`, which works from any process, bundled or not (the banner is
+attributed to Script Editor). The U4 `.app` has a bundle id, so switching it to
+`UNUserNotificationCenter` is now possible but not done: it needs
+`pyobjc-framework-UserNotifications` and a second code path for `uv run`. The text is
 passed as script arguments, never interpolated into the script, and only reaches
 the local Notification Center.
 """

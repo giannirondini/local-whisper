@@ -62,6 +62,9 @@ STOP_TITLE = "Stop Recording"
 INSTRUCTION_TITLE = "Modify with Voice"
 STOP_INSTRUCTION_TITLE = "Stop Instruction"
 LOADING_STATUS = "Loading Whisper model…"
+DOWNLOAD_ICON = "⬇️"
+DOWNLOAD_TITLE = "Downloading Whisper model"
+DOWNLOADED_TITLE = "Whisper model downloaded"
 COPIED_TITLE = "Copied to clipboard"
 FALLBACK_TITLE = "Raw transcript copied"
 ERROR_TITLE = "LocalWhisper error"
@@ -136,7 +139,19 @@ class _LoadFailed:
     message: str
 
 
-_Message = Event | _Attached | _LoadFailed
+@dataclass(frozen=True)
+class _Downloading:
+    model: str
+    done: int
+    total: int | None
+
+
+@dataclass(frozen=True)
+class _Loading:
+    """The model is on disk (downloaded or cached) and is being loaded into memory."""
+
+
+_Message = Event | _Attached | _LoadFailed | _Downloading | _Loading
 
 
 def preview(text: str, limit: int = PREVIEW_CHARS) -> str:
@@ -145,6 +160,15 @@ def preview(text: str, limit: int = PREVIEW_CHARS) -> str:
     if len(flat) <= limit:
         return flat
     return flat[: limit - 1].rstrip() + "…"
+
+
+def download_status(model: str, done: int, total: int | None) -> str:
+    """Status line for the first-run model download, e.g. `… 45% of 145 MB`."""
+    mb = 1024 * 1024
+    if total:
+        percent = min(100, done * 100 // total)
+        return f"Downloading Whisper model {model}… {percent}% of {total / mb:.0f} MB"
+    return f"Downloading Whisper model {model}… {done / mb:.0f} MB"
 
 
 def _nothing(*_args: object) -> None:
@@ -186,6 +210,7 @@ class MenuBarPresenter:
         self._engine: Engine | None = None
         self.model = MenuModel(icon=LOADING_ICON, status=LOADING_STATUS, settings=settings)
         self._shown: MenuModel | None = None
+        self._download_announced = False
 
     @property
     def engine(self) -> Engine | None:
@@ -205,6 +230,14 @@ class MenuBarPresenter:
         """Hand over the loaded engine. Subscribes immediately so no event is lost."""
         engine.subscribe(self.post)
         self._queue.put(_Attached(engine, warning))
+
+    def downloading(self, model: str, done: int, total: int | None) -> None:
+        """Loader thread: first-run model download progress (`done`/`total` bytes)."""
+        self._queue.put(_Downloading(model, done, total))
+
+    def loading(self) -> None:
+        """Loader thread: the model files are local and are now being loaded."""
+        self._queue.put(_Loading())
 
     def fail(self, message: str) -> None:
         """Report that the engine could not be built; the app stays up so Quit works."""
@@ -316,7 +349,22 @@ class MenuBarPresenter:
                 hotkey = model.settings.hotkey
                 status = f"⚠️ {warning}" if warning else f"Ready · hotkey {hotkey}"
                 return replace(model, icon=ICONS[State.IDLE], state=State.IDLE, status=status)
+            case _Downloading(model=name, done=done, total=total):
+                if not self._download_announced:
+                    # The one moment the app uses the network: say so, and say it is one-time.
+                    self._download_announced = True
+                    size = f" ({total / (1024 * 1024):.0f} MB)" if total else ""
+                    body = f"One-time download of {name}{size} from Hugging Face."
+                    self._notify(DOWNLOAD_TITLE, body)
+                status = download_status(name, done, total)
+                return replace(model, icon=DOWNLOAD_ICON, state=None, status=status)
+            case _Loading():
+                if self._download_announced:
+                    self._notify(DOWNLOADED_TITLE, "Loading it; works offline from now on.")
+                return replace(model, icon=LOADING_ICON, state=None, status=LOADING_STATUS)
             case _LoadFailed(message=text):
+                # Nothing works without the model, and the app has no window: be loud.
+                self._alert(ERROR_TITLE, text)
                 return replace(model, icon=FAILED_ICON, state=None, status=f"❌ {text}")
             case StateChanged(current=state):
                 return replace(model, icon=ICONS[state], state=state)

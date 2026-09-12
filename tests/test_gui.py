@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import replace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pyperclip
 import pytest
@@ -32,8 +32,12 @@ from localwhisper.events import (
     Transcribing,
     TranscriptReady,
 )
+from localwhisper.gui.hotkey import CMD_KEY, CONTROL_KEY, OPTION_KEY, SHIFT_KEY, parse_hotkey
 from localwhisper.gui.presenter import (
     COPIED_TITLE,
+    DOWNLOAD_ICON,
+    DOWNLOAD_TITLE,
+    DOWNLOADED_TITLE,
     ERROR_TITLE,
     FAILED_ICON,
     FALLBACK_TITLE,
@@ -49,6 +53,7 @@ from localwhisper.gui.presenter import (
     TRANSCRIBING_ICON,
     MenuBarPresenter,
     MenuModel,
+    download_status,
     preview,
 )
 
@@ -137,13 +142,40 @@ class TestLoading:
         presenter.attach(engine, warning="Cannot reach Ollama")
         assert presenter.drain().status == "⚠️ Cannot reach Ollama"
 
-    def test_load_failure_keeps_everything_disabled(self, presenter):
+    def test_load_failure_keeps_everything_disabled(self, presenter, side_effects):
         presenter.fail("Could not load Whisper model: boom")
         model = presenter.drain()
         assert model.icon == FAILED_ICON
         assert not model.loaded
         assert not model.record_enabled
         assert model.status == "❌ Could not load Whisper model: boom"
+        side_effects["alert"].assert_called_once_with(
+            ERROR_TITLE, "Could not load Whisper model: boom"
+        )
+
+    def test_download_progress_announces_once(self, presenter, side_effects):
+        presenter.downloading("base", 0, 150 * 1024 * 1024)
+        presenter.downloading("base", 75 * 1024 * 1024, 150 * 1024 * 1024)
+        model = presenter.drain()
+        assert model.icon == DOWNLOAD_ICON
+        assert not model.loaded
+        assert model.status == "Downloading Whisper model base… 50% of 150 MB"
+        side_effects["notify"].assert_called_once_with(
+            DOWNLOAD_TITLE, "One-time download of base (150 MB) from Hugging Face."
+        )
+
+    def test_loading_after_download(self, presenter, side_effects):
+        presenter.downloading("base", 10, 10)
+        presenter.loading()
+        model = presenter.drain()
+        assert (model.icon, model.status) == (LOADING_ICON, LOADING_STATUS)
+        assert side_effects["notify"].call_args.args[0] == DOWNLOADED_TITLE
+
+    def test_download_status_without_total(self):
+        assert download_status("small", 3 * 1024 * 1024, None) == (
+            "Downloading Whisper model small… 3 MB"
+        )
+        assert download_status("small", 20, 10).endswith("100% of 0 MB")
 
     def test_commands_before_attach_are_ignored(self, presenter, engine):
         presenter.toggle_record()
@@ -505,6 +537,66 @@ class TestPreview:
 
     def test_short_text_untouched(self):
         assert preview("short", limit=5) == "short"
+
+
+class TestParseHotkey:
+    def test_default_hotkey(self):
+        assert parse_hotkey("<cmd>+<shift>+g") == (0x05, CMD_KEY | SHIFT_KEY)
+
+    def test_named_keys_and_side_specific_modifiers(self):
+        assert parse_hotkey("<ctrl_l>+<alt_r>+<space>") == (0x31, CONTROL_KEY | OPTION_KEY)
+        assert parse_hotkey("<cmd>+<f5>") == (0x60, CMD_KEY)
+
+    @pytest.mark.parametrize(
+        "hotkey", ["g", "<cmd>+<shift>", "<cmd>+g+h", "<cmd>+ä", "<hyper>+g", "<cmd>+space"]
+    )
+    def test_rejects_what_a_hot_key_cannot_express(self, hotkey):
+        with pytest.raises(ValueError):
+            parse_hotkey(hotkey)
+
+
+class TestHotkeyBinding:
+    """Native first, pynput as the fallback; skipped without the `gui` extra."""
+
+    @pytest.fixture
+    def menubar(self):
+        pytest.importorskip("rumps")
+        from localwhisper.gui import menubar
+
+        return menubar
+
+    def test_native_binding_is_preferred(self, menubar):
+        native = MagicMock()
+        with (
+            patch.object(menubar, "NativeHotkey", return_value=native),
+            patch.object(menubar.keyboard, "GlobalHotKeys") as pynput,
+        ):
+            binding = menubar.HotkeyBinding(MagicMock())
+            binding.bind(HOTKEY)
+        native.bind.assert_called_once_with(HOTKEY)
+        pynput.assert_not_called()
+        assert binding.native
+
+    def test_refused_combination_falls_back_to_pynput(self, menubar):
+        native = MagicMock()
+        native.bind.side_effect = ValueError("macOS refused")
+        with (
+            patch.object(menubar, "NativeHotkey", return_value=native),
+            patch.object(menubar.keyboard, "GlobalHotKeys") as pynput,
+        ):
+            binding = menubar.HotkeyBinding(MagicMock())
+            binding.bind(HOTKEY)
+        pynput.return_value.start.assert_called_once()
+        native.stop.assert_called_once()
+        assert not binding.native
+
+    def test_invalid_syntax_raises_before_touching_anything(self, menubar):
+        native = MagicMock()
+        with patch.object(menubar, "NativeHotkey", return_value=native):
+            binding = menubar.HotkeyBinding(MagicMock())
+            with pytest.raises(ValueError):
+                binding.bind("<nonsense>+")
+        native.bind.assert_not_called()
 
 
 class TestShell:

@@ -9,17 +9,23 @@ engine down before the process terminates.
 
 The Whisper model is loaded on a background thread so the status item appears
 immediately with a "loading" glyph instead of the app looking dead for a few
-seconds (or minutes, on the first-run download).
+seconds. On first run it is downloaded first, with progress in the status line.
+
+The same `main()` runs from `uv run localwhisper-gui` and inside the PyInstaller
+bundle (`packaging/`); `is_bundled()` gates what only makes sense in the `.app`
+(launch at login, logging to ~/Library/Logs since there is no terminal).
 """
 
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import TypeVar
 
@@ -36,10 +42,12 @@ from ..config import (
     resolve_config_path,
     save_setting,
 )
-from ..core import AIProcessor
+from ..core import AIProcessor, ModelDownloadError, cached_whisper_model, download_whisper_model
 from ..engine import Engine
+from . import is_bundled, login
+from .hotkey import NativeHotkey
 from .notify import notify
-from .presenter import MenuBarPresenter, MenuModel, preview
+from .presenter import ERROR_TITLE, MenuBarPresenter, MenuModel, preview
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,8 @@ SHOW_TITLE = "Show Last Text…"
 COPY_AGAIN_TITLE = "Copy Again"
 SETTINGS_TITLE = "Settings"
 AUTO_PASTE_TITLE = "Auto-paste (Cmd+V after copying)"
+LOGIN_TITLE = "Launch at Login"
+LOG_FILE = Path.home() / "Library" / "Logs" / "LocalWhisper" / "localwhisper.log"
 QUIT_TITLE = "Quit LocalWhisper"
 DRAIN_INTERVAL = 0.1
 """Seconds between queue drains; the latency between an engine event and the menu."""
@@ -67,7 +77,8 @@ SETTING_HINTS: dict[str, str] = {
     "Takes effect on the next launch.",
     "ollama_model": "Ollama model tag, as in `ollama list`. Applies immediately.",
     "language": "ISO 639-1 code (en, it, …), or empty for auto-detect. Applies immediately.",
-    "hotkey": "pynput syntax, e.g. <cmd>+<shift>+g. Applies immediately.",
+    "hotkey": "pynput syntax, e.g. <cmd>+<shift>+g, with at least one modifier. "
+    "Applies immediately.",
 }
 
 
@@ -96,11 +107,17 @@ class MenuBarApp(rumps.App):  # type: ignore[misc]  # rumps has no type stubs
             for name, label in SETTING_LABELS.items()
         }
         self._auto_paste = rumps.MenuItem(AUTO_PASTE_TITLE, callback=self._auto_paste_clicked)
+        # An OS setting, not a config key: the truth lives in SMAppService, read at startup.
+        self._login: rumps.MenuItem | None = None
+        if login.available():
+            self._login = rumps.MenuItem(LOGIN_TITLE, callback=self._login_clicked)
+            self._login.state = 1 if login.status() in login.ON_STATES else 0
         settings = rumps.MenuItem(SETTINGS_TITLE)
         settings.update(
             [
                 *self._setting_items.values(),
                 self._auto_paste,
+                *([self._login] if self._login is not None else []),
                 None,
                 rumps.MenuItem(f"Config file: {_pretty(config_path)}"),  # label only
             ]
@@ -165,8 +182,9 @@ class MenuBarApp(rumps.App):  # type: ignore[misc]  # rumps has no type stubs
         focus-stealing prevention can make `activateIgnoringOtherApps_` (and
         even the deprecated Carbon `SetFrontProcessWithOptions` fallback below)
         silently do nothing for a process not launched from a proper `.app`
-        bundle. We still call every documented lever, best-effort, but a
-        packaged `.app` (UI plan phase 3) is the actual fix, not this method.
+        bundle. We still call every documented lever, best-effort. Whether the
+        packaged `.app` (UI plan U4) fixes it is not verified yet; until it is,
+        keep this method and the fallback.
         """
         previous = NSWorkspace.sharedWorkspace().frontmostApplication()
         _force_activate()
@@ -254,6 +272,20 @@ class MenuBarApp(rumps.App):  # type: ignore[misc]  # rumps has no type stubs
     def _auto_paste_clicked(self, _item: rumps.MenuItem) -> None:
         self._presenter.update_setting("auto_paste", not self._presenter.settings.auto_paste)
 
+    def _login_clicked(self, item: rumps.MenuItem) -> None:
+        try:
+            result = login.set_enabled(not item.state)
+        except login.LoginItemError as e:
+            self.show_alert(ERROR_TITLE, str(e))
+            return
+        item.state = 1 if result in login.ON_STATES else 0
+        if result == login.REQUIRES_APPROVAL:
+            self.show_alert(
+                LOGIN_TITLE,
+                "macOS needs your approval: System Settings → General → Login Items, "
+                "then allow LocalWhisper.",
+            )
+
     def _quit_clicked(self, _item: rumps.MenuItem) -> None:
         # terminate_() never returns, so everything that must happen goes first.
         self._on_quit()
@@ -313,7 +345,20 @@ def paste() -> None:
 
 
 def load_engine(settings: Settings, presenter: MenuBarPresenter) -> None:
-    """Build the AI processor, recorder and engine; report to the presenter either way."""
+    """Download the model if needed, build the engine; report to the presenter either way."""
+    name = settings.whisper_model
+    if cached_whisper_model(name) is None:
+        try:
+            download_whisper_model(name, partial(presenter.downloading, name))
+        except ModelDownloadError as e:
+            logger.exception("Could not download Whisper model")
+            presenter.fail(f"{e}. Check the network connection and restart LocalWhisper.")
+            return
+        except Exception as e:  # last resort: a dead loader thread would leave ⬇️ up forever
+            logger.exception("Unexpected error while downloading the Whisper model")
+            presenter.fail(f"Could not download Whisper model {name!r}: {e}")
+            return
+        presenter.loading()
     try:
         ai = AIProcessor(settings)
     except Exception as e:
@@ -326,26 +371,72 @@ def load_engine(settings: Settings, presenter: MenuBarPresenter) -> None:
 
 
 class HotkeyBinding:
-    """Owns the pynput listener so the hotkey can be re-registered from Settings."""
+    """Owns the global hotkey so it can be re-registered from Settings. Main thread only.
+
+    Prefers the native Carbon hot key (`hotkey.py`: consumes the keystroke, needs no
+    privacy permission, fires on the main thread). Falls back to a pynput listener
+    (observes only, needs Accessibility + Input Monitoring, fires on its own thread)
+    when Carbon cannot be loaded or refuses the combination.
+    """
 
     def __init__(self, on_activate: Callable[[], None]) -> None:
         self._on_activate = on_activate
         self._listener: keyboard.GlobalHotKeys | None = None
+        self._native: NativeHotkey | None = None
+        try:
+            self._native = NativeHotkey(on_activate)
+        except OSError as e:
+            logger.warning("Native hotkeys unavailable, using pynput: %s", e)
+        self.native = False
+        """Whether the current binding is the native one (for logging and diagnostics)."""
 
     def bind(self, hotkey: str) -> None:
-        """Replace the current binding. Raises `ValueError` (from pynput) if `hotkey` is invalid."""
-        keyboard.HotKey.parse(hotkey)  # validate before touching the running listener
+        """Replace the current binding. Raises `ValueError` if `hotkey` is invalid."""
+        keyboard.HotKey.parse(hotkey)  # pynput syntax is the config contract; validate first
+        if self._native is not None:
+            try:
+                self._native.bind(hotkey)
+            except ValueError as e:
+                logger.warning("Native hot key unavailable for %r (%s); using pynput", hotkey, e)
+            else:
+                self._stop_listener()
+                self.native = True
+                logger.info("Hotkey %s registered natively", hotkey)
+                return
         listener = keyboard.GlobalHotKeys({hotkey: self._on_activate})
         listener.daemon = True
         self.stop()
         listener.start()
         listener.wait()  # stopping a listener whose run loop is not up yet aborts the process
         self._listener = listener
+        self.native = False
+        logger.info("Hotkey %s bound through pynput", hotkey)
 
     def stop(self) -> None:
+        if self._native is not None:
+            self._native.stop()
+        self._stop_listener()
+
+    def _stop_listener(self) -> None:
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
+
+
+def _configure_logging(verbose: bool) -> None:
+    """Terminal: log only with --verbose. Bundle: always to a rotating file, since there is no
+    terminal to read. Log lines carry states, durations and model names, never note text."""
+    fmt = "%(asctime)s %(name)s %(levelname)s: %(message)s"
+    if is_bundled():
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=1_000_000, backupCount=2, encoding="utf-8"
+        )
+        logging.basicConfig(level=logging.INFO, format=fmt, handlers=[handler])
+        # One INFO line per Hugging Face request, signed CDN URLs included: noise, not diagnosis.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+    elif verbose:
+        logging.basicConfig(level=logging.INFO, format=fmt)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -353,15 +444,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         settings = load_settings(argv)
     except ConfigError as e:
-        # No UI exists yet; stderr is the only channel for a startup error.
+        # No menu exists yet: stderr for a terminal launch, an alert for the .app (no terminal).
         sys.stderr.write(f"Configuration error: {e}\n")
+        if is_bundled():
+            rumps.alert(title="LocalWhisper configuration error", message=str(e))
         return 2
     config_path = resolve_config_path(build_parser().parse_args(argv))
-
-    if settings.verbose:
-        logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s"
-        )
+    _configure_logging(settings.verbose)
 
     hotkey: HotkeyBinding | None = None
     app: MenuBarApp | None = None

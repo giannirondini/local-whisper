@@ -1,10 +1,13 @@
+import time
 from unittest.mock import MagicMock, patch
 
+import httpx
 import numpy as np
 import pytest
 import requests
+from huggingface_hub.errors import LocalEntryNotFoundError
 
-from localwhisper import prompts
+from localwhisper import core, prompts
 from localwhisper.audio import SAMPLE_RATE
 from localwhisper.config import Settings
 from localwhisper.core import (
@@ -13,8 +16,11 @@ from localwhisper.core import (
     OLLAMA_CONNECT_TIMEOUT,
     VAD_PARAMETERS,
     AIProcessor,
+    ModelDownloadError,
     RefinementError,
     TranscriptionError,
+    cached_whisper_model,
+    download_whisper_model,
 )
 
 SETTINGS = Settings(whisper_model="tiny", ollama_model="test-model", ollama_timeout=42.0)
@@ -39,7 +45,11 @@ def _ok_response(payload: dict) -> MagicMock:
 class TestAIProcessor:
     @pytest.fixture
     def mock_whisper(self):
-        with patch("localwhisper.core.WhisperModel") as mock:
+        # No cache lookup either: its result depends on what this machine has downloaded.
+        with (
+            patch("localwhisper.core.WhisperModel") as mock,
+            patch("localwhisper.core.cached_whisper_model", return_value=None),
+        ):
             yield mock
 
     @pytest.fixture
@@ -56,6 +66,12 @@ class TestAIProcessor:
         processor = AIProcessor()
         assert processor.settings == Settings()
         mock_whisper.assert_called_with(Settings().whisper_model, device="cpu", compute_type="int8")
+
+    def test_init_loads_cached_model_by_path(self, mock_whisper):
+        """A cached model is loaded from disk, so faster-whisper does not ping the Hub."""
+        with patch("localwhisper.core.cached_whisper_model", return_value="/cache/tiny"):
+            AIProcessor(SETTINGS)
+        mock_whisper.assert_called_with("/cache/tiny", device="cpu", compute_type="int8")
 
     def test_transcribe_passes_language(self, mock_whisper):
         """F-12: the configured language reaches Whisper (None means auto-detect)."""
@@ -259,3 +275,84 @@ class TestAIProcessor:
         mock_get.return_value = _ok_response({"weird": []})
 
         assert processor.check_ollama() is None
+
+
+class TestModelCache:
+    def test_directory_is_used_as_is(self, tmp_path):
+        assert cached_whisper_model(str(tmp_path)) == str(tmp_path)
+
+    def test_unknown_name_is_left_to_whisper(self):
+        with patch("localwhisper.core.download_model") as download:
+            assert cached_whisper_model("not-a-model") is None
+        download.assert_not_called()
+
+    def test_cached_model_is_looked_up_offline(self):
+        with patch("localwhisper.core.download_model", return_value="/cache/base") as download:
+            assert cached_whisper_model("base") == "/cache/base"
+        download.assert_called_once_with("base", local_files_only=True)
+
+    def test_missing_model_is_none(self):
+        with patch("localwhisper.core.download_model", side_effect=LocalEntryNotFoundError("x")):
+            assert cached_whisper_model("base") is None
+
+
+class TestModelDownload:
+    @pytest.fixture(autouse=True)
+    def hub(self, tmp_path):
+        with (
+            patch.object(core.constants, "HF_HUB_CACHE", str(tmp_path)),
+            patch("localwhisper.core._download_size", return_value=1000),
+            patch("localwhisper.core.DOWNLOAD_POLL_SECONDS", 0.01),
+        ):
+            yield tmp_path
+
+    def test_returns_path_and_reports_completion(self):
+        progress = MagicMock()
+        with patch("localwhisper.core.download_model", return_value="/cache/base") as download:
+            assert download_whisper_model("base", progress) == "/cache/base"
+        download.assert_called_once_with("base")
+        assert progress.call_args_list[-1] == ((1000, 1000),)
+
+    def test_progress_counts_bytes_on_disk(self, hub):
+        blobs = hub / "models--Systran--faster-whisper-base" / "blobs"
+        progress = MagicMock()
+
+        def fake_download(_name):
+            blobs.mkdir(parents=True)
+            (blobs / "abc.incomplete").write_bytes(b"x" * 400)
+            time.sleep(0.1)
+            return "/cache/base"
+
+        with patch("localwhisper.core.download_model", side_effect=fake_download):
+            download_whisper_model("base", progress)
+        assert ((400, 1000),) in progress.call_args_list
+
+    def test_unknown_model_raises_before_any_network(self):
+        with (
+            patch("localwhisper.core.download_model") as download,
+            pytest.raises(ModelDownloadError, match="Unknown Whisper model"),
+        ):
+            download_whisper_model("not-a-model")
+        download.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "error",
+        [httpx.ConnectError("offline"), requests.exceptions.ConnectionError("offline")],
+    )
+    def test_network_failure_is_wrapped(self, error):
+        with (
+            patch("localwhisper.core.download_model", side_effect=error),
+            pytest.raises(ModelDownloadError, match="offline"),
+        ):
+            download_whisper_model("base")
+
+
+def test_package_import_disables_third_party_telemetry():
+    """onnxruntime (via faster-whisper's VAD) uploads usage telemetry to Microsoft unless this
+    variable is set before it initializes; the runtime opt-out call does not stop the uploader."""
+    import os
+
+    import localwhisper  # noqa: F401
+
+    assert os.environ["ORT_DISABLE_TELEMETRY"] == "1"
+    assert os.environ["HF_HUB_DISABLE_TELEMETRY"] == "1"

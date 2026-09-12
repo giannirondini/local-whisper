@@ -63,14 +63,16 @@ The manual checklist (hotkey, silent recording, Ollama down, clean exit) is in [
 - [uv](https://docs.astral.sh/uv/)
 - PortAudio: `brew install portaudio`
 - Ollama: [ollama.com](https://ollama.com)
-- **macOS permissions**: add your terminal (or `.venv/bin/python`) under **System Settings → Privacy & Security → Accessibility** and **Input Monitoring** for the global hotkey; allow **Microphone** on first recording
+- **macOS permissions**: add your terminal (or `.venv/bin/python`) under **System Settings → Privacy & Security → Accessibility** and **Input Monitoring** for the CLI's global hotkey (the menu bar app's native hotkey needs neither); allow **Microphone** on first recording
 
 ### Running the App
 ```bash
 uv run localwhisper            # or: uv run python -m localwhisper
 uv run localwhisper -v         # engine logs on stderr
 uv run localwhisper-gui        # menu bar app (needs the `gui` extra)
+packaging/build_app.sh         # dist/LocalWhisper.app via PyInstaller (the `package` group)
 ```
+Never add a test that builds the bundle; `build/` and `dist/` are git-ignored.
 
 ## 📋 Pull Request Process
 
