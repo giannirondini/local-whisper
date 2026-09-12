@@ -6,12 +6,19 @@ and text refinement using a local Ollama LLM.
 
 from __future__ import annotations
 
+import fnmatch
 import logging
+import threading
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import requests
 from faster_whisper import WhisperModel
+from faster_whisper.utils import available_models, download_model
+from huggingface_hub import HfApi, constants
+from huggingface_hub.errors import LocalEntryNotFoundError
 
 from . import prompts
 from .audio import SAMPLE_RATE
@@ -33,6 +40,26 @@ MIN_AUDIO_SECONDS: float = 0.5
 # Voice-activity detection drops silent stretches before decoding, which is the main
 # defence against "Thank you for watching."-style hallucinations on silence.
 VAD_PARAMETERS: dict[str, int] = {"min_silence_duration_ms": 500}
+
+
+# Files faster-whisper fetches for a model (mirrors `faster_whisper.utils.download_model`).
+MODEL_FILE_PATTERNS: tuple[str, ...] = (
+    "config.json",
+    "preprocessor_config.json",
+    "model.bin",
+    "tokenizer.json",
+    "vocabulary.*",
+)
+
+# How often the download progress callback samples the bytes on disk.
+DOWNLOAD_POLL_SECONDS: float = 0.5
+
+ProgressCallback = Callable[[int, "int | None"], None]
+"""`(downloaded_bytes, total_bytes)`; total is None when the Hub did not report sizes."""
+
+
+class ModelDownloadError(Exception):
+    """Raised when the Whisper model is not cached and cannot be downloaded."""
 
 
 class TranscriptionError(Exception):
@@ -59,9 +86,13 @@ class AIProcessor:
         """
         self.settings: Settings = settings if settings is not None else Settings()
 
-        logger.info("Loading Whisper model %s", self.settings.whisper_model)
+        name = self.settings.whisper_model
+        # A cached model is loaded by path: passing the name makes faster-whisper ask the
+        # Hugging Face Hub for the latest revision on every launch, even fully offline.
+        model = cached_whisper_model(name) or name
+        logger.info("Loading Whisper model %s", name)
         # On Apple Silicon, faster-whisper runs on CPU by default.
-        self.model = WhisperModel(self.settings.whisper_model, device="cpu", compute_type="int8")
+        self.model = WhisperModel(model, device="cpu", compute_type="int8")
         logger.info("Whisper model loaded")
 
     @property
@@ -195,6 +226,97 @@ class AIProcessor:
                 f"Run: ollama pull {self.ollama_model}"
             )
         return None
+
+
+def _repo_id(name: str) -> str | None:
+    """Hub repository for a faster-whisper model name or `org/repo` id; None if unknown."""
+    if "/" in name:
+        return name
+    if name in available_models():
+        # faster-whisper's own name → repo mapping; the utils module exposes no public getter.
+        from faster_whisper.utils import _MODELS
+
+        return _MODELS[name]
+    return None
+
+
+def cached_whisper_model(name: str) -> str | None:
+    """Local directory of `name` if it needs no download (a path, or already cached). No network."""
+    if Path(name).expanduser().is_dir():
+        return str(Path(name).expanduser())
+    if _repo_id(name) is None:
+        return None  # let WhisperModel raise its own "invalid model size" error
+    try:
+        return str(download_model(name, local_files_only=True))
+    except (LocalEntryNotFoundError, OSError):
+        return None
+
+
+def download_whisper_model(name: str, on_progress: ProgressCallback | None = None) -> str:
+    """Download `name` into the Hugging Face cache and return its local directory.
+
+    This is the one network call LocalWhisper makes besides localhost Ollama. Progress
+    is measured from the bytes on disk (faster-whisper disables huggingface_hub's own
+    progress bars), sampled every `DOWNLOAD_POLL_SECONDS` on a helper thread.
+
+    Raises:
+        ModelDownloadError: Unknown model name, no network, or the Hub refused the request.
+    """
+    repo_id = _repo_id(name)
+    if repo_id is None:
+        raise ModelDownloadError(
+            f"Unknown Whisper model {name!r}; expected one of: {', '.join(available_models())}"
+        )
+    total = _download_size(repo_id)
+    repo_dir = Path(constants.HF_HUB_CACHE) / f"models--{repo_id.replace('/', '--')}"
+
+    done = threading.Event()
+
+    def report() -> None:
+        while not done.wait(DOWNLOAD_POLL_SECONDS):
+            if on_progress is not None:
+                on_progress(_dir_bytes(repo_dir / "blobs"), total)
+
+    reporter = threading.Thread(target=report, name="localwhisper-download", daemon=True)
+    reporter.start()
+    logger.info("Downloading Whisper model %s from %s", name, repo_id)
+    try:
+        path = str(download_model(name))
+    # Deliberately broad: huggingface_hub's failures are not one hierarchy (HfHubHTTPError,
+    # raw httpx transport errors since 1.0 — an offline first launch raises httpx.ConnectError —
+    # OSError from the cache), and any of them means the same thing here: no model.
+    except Exception as e:
+        raise ModelDownloadError(f"Could not download Whisper model {name!r}: {e}") from e
+    finally:
+        done.set()
+        reporter.join()
+    if on_progress is not None:
+        on_progress(total or _dir_bytes(repo_dir / "blobs"), total)
+    logger.info("Whisper model %s downloaded to %s", name, path)
+    return path
+
+
+def _download_size(repo_id: str) -> int | None:
+    """Total bytes of the files `download_model` will fetch, or None if the Hub won't say."""
+    try:
+        info = HfApi().model_info(repo_id, files_metadata=True)
+    except Exception:  # noqa: BLE001 - same reasoning as download_whisper_model; size is optional
+        logger.info("Could not read the size of %s; progress will have no total", repo_id)
+        return None
+    sizes = [
+        sibling.size or 0
+        for sibling in info.siblings or []
+        if any(fnmatch.fnmatch(sibling.rfilename, p) for p in MODEL_FILE_PATTERNS)
+    ]
+    return sum(sizes) or None
+
+
+def _dir_bytes(path: Path) -> int:
+    """Bytes under `path`, including partial `.incomplete` downloads; 0 if it does not exist."""
+    try:
+        return sum(f.stat().st_size for f in path.iterdir() if f.is_file())
+    except OSError:
+        return 0
 
 
 def _model_available(wanted: str, names: list[str]) -> bool:

@@ -6,7 +6,7 @@
 
 **LocalWhisper** is a privacy-focused, local voice-to-text tool for macOS. It captures your voice with a global hotkey, transcribes it using OpenAI's **Whisper** model locally, and refines the text (grammar, punctuation) using a local LLM via **Ollama**.
 
-> **Note**: This project is for educational purposes. No audio or text leaves your machine: the only network calls are to Ollama on `localhost` and a one-time download of the Whisper model from Hugging Face on first run (about 150 MB for `base.en`, cached in `~/.cache/huggingface`). After that it runs fully offline.
+> **Note**: This project is for educational purposes. No audio or text leaves your machine: the only network calls are to Ollama on `localhost` and a one-time download of the Whisper model from Hugging Face on first run (about 150 MB for `base.en`, cached in `~/.cache/huggingface`). After that it runs fully offline. Dependencies' own telemetry is switched off at startup: onnxruntime, which faster-whisper uses for voice-activity detection, otherwise reports usage data to Microsoft (`mobile.events.data.microsoft.com`).
 
 ## ✨ Features
 
@@ -32,7 +32,7 @@
     ```bash
     brew install portaudio
     ```
-4.  **macOS permissions**: the global hotkey requires the **terminal you are using** (or the Python binary, e.g. `.venv/bin/python`) to be listed under **System Settings → Privacy & Security → Accessibility** *and* under **Input Monitoring** (recent macOS versions need both). The first recording will also prompt for **Microphone** access.
+4.  **macOS permissions**: the CLI's global hotkey requires the **terminal you are using** (or the Python binary, e.g. `.venv/bin/python`) to be listed under **System Settings → Privacy & Security → Accessibility** *and* under **Input Monitoring** (recent macOS versions need both). The menu bar app registers its hotkey natively and needs neither, except for **Auto-paste**, which needs Accessibility. The first recording will also prompt for **Microphone** access.
 
 ## 🚀 Installation
 
@@ -80,15 +80,24 @@
     ```bash
     uv run localwhisper-gui
     ```
-    A status item appears in the menu bar: ⏳ while the Whisper model loads, 🎙 when ready, 🔴 while recording, 🟠 while recording a spoken instruction, 📝/🧠 while transcribing/refining. The hotkey works exactly as in the CLI. The menu offers:
+    A status item appears in the menu bar: ⬇️ while the Whisper model downloads on first run (progress in the menu), ⏳ while it loads, 🎙 when ready, 🔴 while recording, 🟠 while recording a spoken instruction, 📝/🧠 while transcribing/refining. The hotkey toggles recording as in the CLI, but it is registered natively, so the keystroke no longer also reaches the frontmost app (no more Finder "Go to Folder" on `Cmd+Shift+G`) and no Accessibility/Input Monitoring grant is needed for it. macOS refuses some combinations (for example Option/Shift-only ones, or one another app already registered); the app then falls back to the CLI's listener, which needs those permissions. The menu offers:
     - **Record** / **Stop Recording** (same as the hotkey).
     - **Modify with Voice** / **Stop Instruction**, **Modify with Text…**, **Undo Last Edit**: the `[v]`, `[m]` and `[u]` commands of the CLI.
     - **Show Last Text…** (with a Copy button) and **Copy Again**.
     - A status line with the last result or error.
-    - **Settings ▸**: Whisper model, Ollama model, language and hotkey as text fields, plus an **Auto-paste** checkbox. Changes are written to the config file (other lines and comments are kept). Ollama model, language and hotkey apply immediately; the Whisper model applies on the next launch.
+    - **Settings ▸**: Whisper model, Ollama model, language and hotkey as text fields, plus an **Auto-paste** checkbox (and **Launch at Login** in the packaged app). Changes are written to the config file (other lines and comments are kept). Ollama model, language and hotkey apply immediately; the Whisper model applies on the next launch.
     - **Quit LocalWhisper**.
 
-    Every result is copied to the clipboard and announced with a macOS notification. Until the app is packaged as an `.app` (see `docs/UI_PLAN.md`), notifications are posted through `osascript`, so macOS attributes them to *Script Editor*; if you see none, check **System Settings → Notifications → Script Editor**. With **Auto-paste** on, the app also presses `Cmd+V` in the frontmost application right after copying (this needs the same Accessibility permission as the hotkey). It accepts the same flags, config file and environment variables as the CLI.
+    Every result is copied to the clipboard and announced with a macOS notification. Notifications are posted through `osascript`, also in the packaged app, so macOS attributes them to *Script Editor*; if you see none, check **System Settings → Notifications → Script Editor**. With **Auto-paste** on, the app also presses `Cmd+V` in the frontmost application right after copying (this needs the same Accessibility permission as the hotkey). It accepts the same flags, config file and environment variables as the CLI.
+
+5.  **Packaged app** (`LocalWhisper.app`, no terminal needed):
+    ```bash
+    packaging/build_app.sh           # → dist/LocalWhisper.app (~185 MB, ad-hoc signed)
+    cp -R dist/LocalWhisper.app /Applications/
+    ```
+    It is the same menu bar app in a bundle: no Dock icon, it reads the same config file, and it logs to `~/Library/Logs/LocalWhisper/localwhisper.log` (states, timings and model names; never your text). Ollama is not bundled. On first launch without a cached model it downloads it, showing progress in the menu. Grant **Microphone** to *LocalWhisper* when asked (and **Accessibility** if you use Auto-paste). **Settings ▸ Launch at Login** registers the app with macOS; move it to `/Applications` first, since the login item points at wherever the app is when you turn it on.
+
+    The build is signed ad-hoc, so every rebuild looks like a new app to macOS and it asks for the permissions again. To avoid that, create a self-signed code-signing certificate in Keychain Access (Certificate Assistant → Create a Certificate…, type *Code Signing*) and build with `CODESIGN_IDENTITY="<its name>" packaging/build_app.sh`. The app is not notarized: if you copy it to another Mac, right-click → Open the first time.
 
 ## ⚙️ Configuration
 
@@ -102,7 +111,7 @@ ollama_model = "gemma4:e2b-mlx"
 ollama_url = "http://localhost:11434"
 ollama_timeout = 120         # seconds to wait for one refinement
 keep_alive = "5m"           # how long Ollama keeps the model loaded
-hotkey = "<cmd>+<shift>+g"   # pynput syntax
+hotkey = "<cmd>+<shift>+g"   # pynput syntax; the menu bar app needs at least one modifier
 auto_paste = false           # menu bar app: press Cmd+V after copying a result
 ```
 
@@ -112,7 +121,7 @@ The same keys work as `LOCALWHISPER_WHISPER_MODEL`, `LOCALWHISPER_LANGUAGE`, ...
 
 - **Ears**: `faster-whisper` (default: `base.en` model).
 - **Brain**: `Ollama` (default: `gemma4:e2b-mlx`, called with `think: false`; the transcript is sent as delimited content so the model edits it instead of answering it).
-- **Body**: Python `pynput` for hotkeys and `pyaudio` for recording.
+- **Body**: `pyaudio` for recording; `pynput` for the CLI hotkey, Carbon `RegisterEventHotKey` for the menu bar app's. PyInstaller for the `.app`.
 
 ## 🤝 Contributing
 

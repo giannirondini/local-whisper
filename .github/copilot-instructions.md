@@ -22,7 +22,7 @@ the transcription using a local LLM via Ollama, and copies the result to the cli
 ```
 LocalWhisper/
 ├── src/localwhisper/
-│   ├── __init__.py      # package version
+│   ├── __init__.py      # package version; forces ORT/HF telemetry off before any import
 │   ├── __main__.py      # `python -m localwhisper` → cli.main()
 │   ├── cli.py           # terminal presenter: menu, input(), emoji output, clipboard, hotkey binding
 │   ├── engine.py        # headless engine: State machine, one worker thread, revision history, shutdown()
@@ -33,8 +33,15 @@ LocalWhisper/
 │   ├── prompts.py       # Ollama system prompts, prompt builders, sampling options
 │   └── gui/             # menu bar app (optional extra `gui`; `localwhisper-gui`)
 │       ├── presenter.py # toolkit-free: events → MenuModel, menu clicks → engine calls, settings edits
+│       ├── __init__.py  # is_bundled(): running from the PyInstaller .app
 │       ├── menubar.py   # rumps shell: status item, menu, dialogs, main-thread timer, hotkey, main()
-│       └── notify.py    # user notifications via osascript (no bundle id outside an .app)
+│       ├── hotkey.py    # native global hotkey: Carbon RegisterEventHotKey via ctypes
+│       ├── login.py     # launch at login via SMAppService (bundle only)
+│       └── notify.py    # user notifications via osascript
+├── packaging/
+│   ├── LocalWhisper.spec        # PyInstaller spec; Info.plist lives in its BUNDLE(info_plist=…)
+│   ├── localwhisper_app.py      # bundle entry script → gui.menubar.main()
+│   └── build_app.sh             # uv sync + pyinstaller + codesign → dist/LocalWhisper.app
 ├── tests/               # pytest; one file per module, fakes instead of real audio/models
 ├── docs/
 │   ├── CODE_REVIEW.md           # findings F-01..F-26 and the S1..S5 remediation log
@@ -48,7 +55,8 @@ LocalWhisper/
 ## Architecture
 
 The project is a headless engine with presenters on top. The CLI is the first presenter; the menu
-bar app in `gui/` is the second one (`docs/UI_PLAN.md`; phase 1 is complete).
+bar app in `gui/` is the second one (`docs/UI_PLAN.md`; phases 1 and 3 are complete, phase 2 is not
+built). `packaging/` wraps the menu bar app into `LocalWhisper.app`.
 
 - **`engine.py`** — `Engine` owns the recorder, the AI processor, one `RLock`, one `State`, one worker
   thread and the current note's revision history. Presenters call `start(kind)`, `stop()`, `toggle()`,
@@ -63,7 +71,10 @@ bar app in `gui/` is the second one (`docs/UI_PLAN.md`; phase 1 is complete).
   main thread folds queued events into an immutable `MenuModel` and returns it when it differs from
   the last one returned. The model stores facts (`icon`, `status`, `state`, `has_text`, `settings`);
   item titles and enabled flags are derived properties. `attach(engine, warning)` / `fail(message)`
-  carry the outcome of the background model load through the same queue. Commands (`toggle_record`,
+  carry the outcome of the background model load through the same queue, and so do
+  `downloading(model, done, total)` / `loading()` for the first-run download (status line with
+  percentage, one notification when it starts and one when it ends). A load failure also raises
+  `alert`, since nothing works without the model. Commands (`toggle_record`,
   `toggle_instruction`, `modify`, `undo`, `copy_again`, `update_setting`) run on the main thread and
   may change the model directly. Side effects are injected callables: `copy`, `paste` (auto-paste),
   `notify`, `save` (config file), `rebind_hotkey`. Every delivery (`RefinementReady`, `Reverted`)
@@ -71,19 +82,40 @@ bar app in `gui/` is the second one (`docs/UI_PLAN.md`; phase 1 is complete).
 - **`gui/menubar.py`** — `MenuBarApp(rumps.App)`: builds the menu (Record, Modify with Voice, Modify
   with Text…, Undo, Show Last Text…, Copy Again, status line, Settings ▸, Quit), drains the presenter
   from a `rumps.Timer` (0.1 s), applies the model, opens `rumps.Window` dialogs, and runs `on_quit`
-  before `rumps.quit_application()`. `HotkeyBinding` owns the pynput listener so Settings can rebind
-  it. `main()` loads the engine on a `localwhisper-loader` thread and shuts down in a `finally` so
-  Ctrl+C from a terminal is clean too. Every modal (`rumps.Window` or `rumps.alert`) is shown through
+  before `rumps.quit_application()`. `HotkeyBinding` owns the global hotkey so Settings can rebind
+  it: the native `NativeHotkey` first, a pynput listener only if Carbon cannot load or refuses the
+  combination. `main()` loads the engine on a `localwhisper-loader` thread (downloading the model
+  first when `cached_whisper_model()` finds none) and shuts down in a `finally` so Ctrl+C from a
+  terminal is clean too. In the bundle (`is_bundled()`) it logs to
+  `~/Library/Logs/LocalWhisper/localwhisper.log` and offers Settings ▸ Launch at Login. Every modal (`rumps.Window` or `rumps.alert`) is shown through
   `MenuBarApp._activate_and_run()`, never directly: clicking a status-bar item does not make the
   process frontmost, so a modal shown directly can be visible while keystrokes still go to whichever
   app *was* frontmost, typing silently does nothing (github.com/jaredks/rumps/issues/127, reproduced
   in this app). `_activate_and_run` reactivates first and hands focus back afterwards; skipping it for
   a new dialog reintroduces the bug for that one dialog only.
+- **`gui/hotkey.py`** — `parse_hotkey()` turns pynput syntax into a virtual key code (ANSI key
+  position) + Carbon modifiers; `NativeHotkey` installs one Carbon event handler and
+  registers/unregisters one hot key. A registered hot key consumes the keystroke and needs no
+  privacy permission (F-18). The handler fires on the main thread, but only while an NSApplication
+  run loop is running (rumps' `app.run()`), so it is GUI-only; the CLI keeps pynput. At least one
+  modifier is required; macOS refuses some combinations (Option/Shift-only since macOS 15, or one
+  taken by another app) with a non-zero OSStatus, which `bind()` turns into `ValueError` after
+  restoring the previous binding.
+- **`gui/login.py`** — `available()`, `status()`, `set_enabled()` over
+  `SMAppService.mainAppService()`, loaded with `objc.loadBundle` (no extra PyObjC framework
+  dependency; the NSError out-param metadata is registered by hand). Bundle only: from `uv run` the
+  service is "not found". `REQUIRES_APPROVAL` counts as on.
 - **`gui/notify.py`** — `notify(title, message)` through `osascript` (non-blocking `Popen`, text as
-  arguments). `UNUserNotificationCenter` needs a bundle identifier, which only the U4 `.app` has. A
-  notification can be silently dropped by the OS, so it is not the only channel for a failure: see
-  `alert` below.
-- **`core.py`** — `AIProcessor(settings)`: `transcribe(audio) -> str` (empty string means no speech),
+  arguments), bundled or not. `UNUserNotificationCenter` would now work inside the `.app` (it has a
+  bundle id) but is not wired: it needs `pyobjc-framework-UserNotifications` and a separate path
+  for `uv run`. A notification can be silently dropped by the OS, so it is not the only channel for
+  a failure: see `alert` below.
+- **`core.py`** — `cached_whisper_model(name) -> str | None` finds a model on disk without network
+  access; `AIProcessor` loads a cached model by path so faster-whisper does not query the Hugging
+  Face Hub on every launch. `download_whisper_model(name, on_progress)` is the explicit first-run
+  download (raises `ModelDownloadError`); progress is the byte count of the cache's `blobs/`
+  directory, sampled on a helper thread, because faster-whisper disables huggingface_hub's bars.
+  `AIProcessor(settings)`: `transcribe(audio) -> str` (empty string means no speech),
   `refine_text(text, instruction=None) -> str`, `check_ollama() -> str | None`. Raises
   `TranscriptionError` / `RefinementError`; never returns error strings.
 - **`audio.py`** — `AudioRecorder`: `start_recording()` (raises `AudioDeviceError`), `stop_recording()
@@ -99,7 +131,8 @@ bar app in `gui/` is the second one (`docs/UI_PLAN.md`; phase 1 is complete).
   error to stderr before any UI exists.
 - The engine never imports `pyperclip`, `pynput`, or any UI toolkit. Clipboard and hotkey are
   presenter concerns.
-- Only `gui/menubar.py` imports `rumps`. Anything that maps events to what the menu shows belongs in
+- Only `gui/menubar.py` imports `rumps`. Only `gui/hotkey.py` touches Carbon, only `gui/login.py`
+  touches ServiceManagement. Anything that maps events to what the menu shows belongs in
   `gui/presenter.py`, where it is testable without the `gui` extra.
 - Runtime settings changes go through `Engine.update_settings()`; presenters never touch
   `AIProcessor`. Only Ollama/language settings apply live; `whisper_model` needs a restart.
@@ -184,13 +217,15 @@ brew install portaudio          # PyAudio build dependency
 uv sync --all-extras             # runtime + dev deps + rumps/PyObjC for the menu bar app
 uv run localwhisper --help       # or: uv run python -m localwhisper
 uv run localwhisper-gui          # menu bar app; same flags, config file and env vars
+packaging/build_app.sh           # dist/LocalWhisper.app (PyInstaller, `package` group, ad-hoc signed)
 uv run pytest -q                # ~130 tests, < 1 s, no microphone or model needed
 uv run ruff check && uv run ruff format --check
 uv run mypy src
 ```
 
 - `pyproject.toml` is the only place dependencies are declared (`[project.dependencies]` for runtime,
-  `[dependency-groups] dev` for tooling). There is no `requirements.txt`. Add a dependency with
+  `[dependency-groups] dev` for tooling, `[dependency-groups] package` for PyInstaller, which CI does
+  not install). There is no `requirements.txt`. Add a dependency with
   `uv add <pkg>` (or `uv add --group dev <pkg>`) so `uv.lock` is updated in the same change.
 - `pip` users: `pip install -e . --group dev` (pip ≥ 25.1).
 - `uv sync` alone performs an exact sync and drops anything not declared for that command, so a
@@ -214,16 +249,24 @@ uv run mypy src
 
 ## When Generating Code
 
-1. **Privacy first**: never add features that send data anywhere but `localhost` Ollama.
+1. **Privacy first**: never add features that send data anywhere but `localhost` Ollama. That
+   includes dependencies: onnxruntime (pulled in by faster-whisper for the VAD) uploads telemetry
+   to `mobile.events.data.microsoft.com` unless `ORT_DISABLE_TELEMETRY=1` is set before it
+   initializes, which `localwhisper/__init__.py` does; `onnxruntime.disable_telemetry_events()` alone
+   leaves the uploader running. When adding or upgrading a native dependency, check it for built-in
+   telemetry (`strings` on its libraries, grep for `http`/`collector`).
 2. **Keep audio in memory**: numpy buffers straight to Whisper; never write audio to disk except via `save_wav()`.
 3. **Offline**: everything must work without internet after the first Whisper model download.
 4. **Never store text persistently** (notes, history, clipboard content) unless behind an explicit opt-in setting.
 5. **User feedback goes through events**; the CLI renders them with emoji prefixes (🎤 recording, 📝 transcribing, 🧠 refining, ✨ output, 📋 clipboard, ⚠️ notice, ❌ error).
 6. **Never block the menu thread or the hotkey thread** with AI work; queue a job.
 7. **Do not weaken error handling**: an error must never end up on the clipboard.
-8. **macOS permissions**: the global hotkey needs the terminal (or the Python binary) under
-   **System Settings → Privacy & Security → Accessibility** *and* **Input Monitoring**; the mic needs
-   **Microphone**. Keep `README.md` in sync when touching this.
+8. **macOS permissions**: the CLI's pynput hotkey needs the terminal (or the Python binary) under
+   **System Settings → Privacy & Security → Accessibility** *and* **Input Monitoring**; the menu bar
+   app's native hotkey needs neither (auto-paste still needs Accessibility); the mic needs
+   **Microphone**, which in the `.app` is requested with `NSMicrophoneUsageDescription` from the
+   spec's `info_plist`. Ad-hoc signed builds change identity on every build, so macOS asks again.
+   Keep `README.md` in sync when touching this.
 9. **Update docs in the same change**: this file for architecture and patterns, `README.md` for
    user-visible behaviour, `docs/CODE_REVIEW.md` when closing a finding.
 
@@ -240,6 +283,8 @@ uv run mypy src
 | Change the Ollama model choice | Update `docs/OLLAMA_MODEL_DECISION.md` first, then the `Settings` default and the `ollama pull` line in `README.md` |
 | Adjust audio constants | Top of `audio.py` |
 | Add a dependency | `uv add ...`; never edit `uv.lock` by hand |
+| A dependency breaks inside `LocalWhisper.app` only | `packaging/LocalWhisper.spec`: add the package to the `collect_all` loop (data files, dylibs) or to `hiddenimports`; rebuild and read `~/Library/Logs/LocalWhisper/localwhisper.log` |
+| Change Info.plist keys (permissions, bundle id, version) | `BUNDLE(info_plist=…)` in `packaging/LocalWhisper.spec`; the version comes from `localwhisper.__version__` |
 
 ## Testing Checklist
 
@@ -259,3 +304,9 @@ Manual, before a release or after touching `audio.py`, `cli.py` or the hotkey:
       Ctrl+C in the terminal also exits cleanly but may print a harmless `resource_tracker: ...
       leaked semaphore` warning (tqdm's multiprocessing lock from the Hugging Face model load
       meets PyObjC's Mach SIGINT handler); the menu's Quit does not.
+- [ ] `packaging/build_app.sh`, then `open dist/LocalWhisper.app` with the terminal closed: hotkey
+      records from another app and the keystroke does not reach that app (Finder: no Go to Folder);
+      Microphone is requested for *LocalWhisper*; a Settings dialog accepts typing; Launch at Login
+      toggles (System Settings → General → Login Items shows it). First-run download:
+      `open -n --env HF_HOME=$(mktemp -d) --env LOCALWHISPER_WHISPER_MODEL=tiny.en dist/LocalWhisper.app`
+      shows ⬇️ and a percentage, then 🎙.
