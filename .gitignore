@@ -77,6 +77,9 @@ dmypy.json
 *.log
 logs/
 
+# Docs
+docs/*
+
 # macOS
 .DS_Store
 .AppleDouble

@@ -18,23 +18,26 @@ LocalWhisper is built on these core principles:
    git clone https://github.com/YOUR_USERNAME/LocalWhisper.git
    cd LocalWhisper
    ```
-3. Install dependencies:
+3. Install dependencies (runtime + dev tools, pinned by `uv.lock`):
    ```bash
-   pip install -r requirements.txt
-   pip install -e .
+   brew install portaudio
+   uv sync --all-extras    # drop --all-extras if you only work on the CLI
    ```
-4. Make sure you have Ollama running with a model:
+   A later plain `uv sync` (no flags) performs an exact sync and removes rumps/PyObjC again since
+   they are an optional extra; always pass `--all-extras` while touching `src/localwhisper/gui/`.
+4. Make sure you have Ollama running with the default model:
    ```bash
-   ollama pull mistral
+   ollama pull gemma4:e2b-mlx
    ```
+5. Read [.github/copilot-instructions.md](.github/copilot-instructions.md): it is the reference for the architecture, the threading rules and where things go.
 
 ## 📝 Making Changes
 
 ### Code Style
-- Follow PEP 8 conventions
-- Use type hints for function parameters and return values
-- Add docstrings to new functions
-- Use meaningful variable names
+- `ruff` enforces PEP 8 and import order; `ruff format` formats (no black)
+- Type hints on every function signature; `mypy src` must stay clean
+- Add docstrings to new public functions
+- Dependencies go in `pyproject.toml` via `uv add`; commit the updated `uv.lock`. There is no `requirements.txt`.
 
 ### Commit Messages
 Use clear, descriptive commit messages:
@@ -44,30 +47,36 @@ Use clear, descriptive commit messages:
 - `refactor: simplify audio recording logic`
 
 ### Testing Your Changes
-Before submitting a PR:
-- [ ] Application starts without errors
-- [ ] Hotkey works correctly
-- [ ] Recording and transcription function properly
-- [ ] No regressions in existing features
+CI runs these on macOS for Python 3.12; run them locally first:
+```bash
+uv run ruff check
+uv run ruff format --check
+uv run mypy src
+uv run pytest -q
+```
+The manual checklist (hotkey, silent recording, Ollama down, clean exit) is in [.github/copilot-instructions.md](.github/copilot-instructions.md#testing-checklist).
 
 ## 🔧 Development Setup
 
 ### Prerequisites
-- Python 3.10+ (use pyenv if needed: `pyenv install 3.11.9 && pyenv local 3.11.9`)
+- Python 3.12+ (`uv sync` picks up `.python-version`; older versions lack `onnxruntime` wheels, a faster-whisper dependency)
+- [uv](https://docs.astral.sh/uv/)
 - PortAudio: `brew install portaudio`
 - Ollama: [ollama.com](https://ollama.com)
-- **Accessibility Permission**: add **your Terminal** to **System Settings → Privacy & Security → Accessibility** for the global hotkey to work
+- **macOS permissions**: add your terminal (or `.venv/bin/python`) under **System Settings → Privacy & Security → Accessibility** and **Input Monitoring** for the global hotkey; allow **Microphone** on first recording
 
 ### Running the App
 ```bash
-python -m localwhisper
+uv run localwhisper            # or: uv run python -m localwhisper
+uv run localwhisper -v         # engine logs on stderr
+uv run localwhisper-gui        # menu bar app (needs the `gui` extra)
 ```
 
 ## 📋 Pull Request Process
 
 1. Create a feature branch from `main`
 2. Make your changes
-3. Update documentation if needed
+3. Update documentation in the same PR: `.github/copilot-instructions.md` for architecture/patterns, `README.md` for user-visible behaviour
 4. Submit a pull request with a clear description
 
 ## 🐛 Reporting Issues

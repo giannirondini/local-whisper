@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # PyAudio and the global hotkey are macOS-only concerns; test where the app runs.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PortAudio (PyAudio build dependency)
+        run: brew install portaudio
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install project and dev tools from the lock file
+        run: uv sync --frozen --all-extras --python ${{ matrix.python-version }}
+
+      - name: Lint
+        run: uv run ruff check
+
+      - name: Format check
+        run: uv run ruff format --check
+
+      - name: Type check
+        run: uv run mypy src
+
+      - name: Tests
+        run: uv run pytest -q
